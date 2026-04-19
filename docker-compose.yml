@@ -1,0 +1,26 @@
+services:
+  cookie-bridge:
+    build: .
+    restart: always
+    environment:
+      - NEW_DOMAIN=${DOMAIN}
+      - BRIDGE_SECRET=${BRIDGE_SECRET}
+      - NODE_ENV=production
+    labels:
+      traefik.enable: "true"
+
+      # Old domain — catch-all routes to /export
+      traefik.http.routers.bridge-export.rule: "Host(`${OLD_DOMAIN}`)"
+      traefik.http.routers.bridge-export.entrypoints: websecure
+      traefik.http.routers.bridge-export.tls.certResolver: letsencrypt
+      traefik.http.routers.bridge-export.priority: "1"
+      traefik.http.routers.bridge-export.middlewares: bridge-export-prefix
+      traefik.http.middlewares.bridge-export-prefix.addprefix.prefix: "/export"
+      traefik.http.services.cookie-bridge.loadbalancer.server.port: "3099"
+
+      # New domain — /_bridge routes to /import
+      traefik.http.routers.bridge-import.rule: "Host(`${DOMAIN}`) && Path(`/_bridge`)"
+      traefik.http.routers.bridge-import.entrypoints: websecure
+      traefik.http.routers.bridge-import.priority: "100"
+      traefik.http.routers.bridge-import.middlewares: bridge-import-rewrite
+      traefik.http.middlewares.bridge-import-rewrite.replacepath.path: "/import"
