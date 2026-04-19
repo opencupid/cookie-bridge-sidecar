@@ -34,7 +34,7 @@ app.get('/export/*', async (req, reply) => {
   const s = req.cookies.__session
   const r = req.cookies.__refresh
 
-  if (!s && !r) return reply.redirect(`${NEW_ORIGIN}/${path}`)
+  if (!s && !r) return reply.code(204).send()
 
   const token = encrypt({ s, r, p: `/${path}`, exp: Date.now() + TTL * 1000 })
   return reply.redirect(`${NEW_ORIGIN}/_bridge?t=${token}`)
