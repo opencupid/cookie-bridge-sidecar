@@ -5,8 +5,6 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
 const app = Fastify()
 app.register(cookie)
 
-const FALLBACK_DOMAIN = process.env.NEW_DOMAIN
-const FALLBACK_ORIGIN = `https://${FALLBACK_DOMAIN}`
 const KEY = Buffer.from(process.env.BRIDGE_SECRET, 'hex')
 const TTL = 60
 const SECURE = process.env.NODE_ENV === 'production'
@@ -30,26 +28,28 @@ function decrypt(token) {
   return JSON.parse(plain.toString('utf8'))
 }
 
+// Only accept local paths. Rejects protocol-relative `//host` and absolute URLs.
+function safePath(p) {
+  if (typeof p !== 'string' || !p.startsWith('/') || p.startsWith('//')) return null
+  return p
+}
+
 app.get('/export/*', async (req, reply) => {
-  const path = req.params['*'] || ''
+  const target = req.cookies.__o
+  if (!target) return reply.code(400).send('missing __o cookie')
+  const targetOrigin = `https://${target}`
+
+  const dest = safePath(req.query.to) || `/${req.params['*'] || ''}`
   const s = req.cookies.__session
   const r = req.cookies.__refresh
 
-  // Origin brand comes from the __o cookie (set by the backend when the user's
-  // home brand differs from the serving host). Fall back to NEW_DOMAIN for
-  // deployments that haven't started setting __o yet.
-  const target = req.cookies.__o || FALLBACK_DOMAIN
-  const targetOrigin = `https://${target}`
-
-  // Always clear source-host session cookies — the user is leaving this brand.
-  // __o is persistent by design and must NOT be cleared.
   const clearOpts = { path: '/', secure: SECURE, sameSite: 'strict' }
   reply.clearCookie('__session', clearOpts)
   reply.clearCookie('__refresh', clearOpts)
 
-  if (!s && !r) return reply.redirect(`${targetOrigin}/${path}`)
+  if (!s && !r) return reply.redirect(`${targetOrigin}${dest}`)
 
-  const token = encrypt({ s, r, p: `/${path}`, exp: Date.now() + TTL * 1000 })
+  const token = encrypt({ s, r, p: dest, exp: Date.now() + TTL * 1000 })
   return reply.redirect(`${targetOrigin}/_bridge?t=${token}`)
 })
 
@@ -59,10 +59,10 @@ app.get('/import', async (req, reply) => {
   try {
     data = decrypt(t)
   } catch {
-    return reply.redirect(FALLBACK_ORIGIN)
+    return reply.code(400).send('invalid token')
   }
 
-  if (Date.now() > data.exp) return reply.redirect(FALLBACK_ORIGIN)
+  if (Date.now() > data.exp) return reply.code(400).send('expired token')
 
   if (data.s) {
     reply.setCookie('__session', data.s, {
@@ -77,9 +77,7 @@ app.get('/import', async (req, reply) => {
     })
   }
 
-  // Response is served on the target host, so a relative redirect keeps us
-  // on the same origin without coupling the import path to NEW_DOMAIN.
-  return reply.redirect(data.p || '/')
+  return reply.redirect(safePath(data.p) || '/')
 })
 
 app.listen({ port: 3099, host: '0.0.0.0' })

@@ -3,11 +3,9 @@ import assert from 'node:assert/strict'
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
 
 const SECRET = randomBytes(32).toString('hex')
-const NEW_DOMAIN = 'new.example.org'
 const ORIGIN_DOMAIN = 'origin.example.org'
 
 process.env.BRIDGE_SECRET = SECRET
-process.env.NEW_DOMAIN = NEW_DOMAIN
 process.env.NODE_ENV = 'production'
 
 const KEY = Buffer.from(SECRET, 'hex')
@@ -40,26 +38,30 @@ async function buildApp() {
   const fastify = Fastify()
   fastify.register(cookie)
 
-  const FALLBACK_DOMAIN = process.env.NEW_DOMAIN
-  const FALLBACK_ORIGIN = `https://${FALLBACK_DOMAIN}`
   const TTL = 60
   const SECURE = process.env.NODE_ENV === 'production'
 
+  function safePath(p) {
+    if (typeof p !== 'string' || !p.startsWith('/') || p.startsWith('//')) return null
+    return p
+  }
+
   fastify.get('/export/*', async (req, reply) => {
-    const path = req.params['*'] || ''
+    const target = req.cookies.__o
+    if (!target) return reply.code(400).send('missing __o cookie')
+    const targetOrigin = `https://${target}`
+
+    const dest = safePath(req.query.to) || `/${req.params['*'] || ''}`
     const s = req.cookies.__session
     const r = req.cookies.__refresh
-
-    const target = req.cookies.__o || FALLBACK_DOMAIN
-    const targetOrigin = `https://${target}`
 
     const clearOpts = { path: '/', secure: SECURE, sameSite: 'strict' }
     reply.clearCookie('__session', clearOpts)
     reply.clearCookie('__refresh', clearOpts)
 
-    if (!s && !r) return reply.redirect(`${targetOrigin}/${path}`)
+    if (!s && !r) return reply.redirect(`${targetOrigin}${dest}`)
 
-    const token = encrypt({ s, r, p: `/${path}`, exp: Date.now() + TTL * 1000 })
+    const token = encrypt({ s, r, p: dest, exp: Date.now() + TTL * 1000 })
     return reply.redirect(`${targetOrigin}/_bridge?t=${token}`)
   })
 
@@ -69,10 +71,10 @@ async function buildApp() {
     try {
       data = decrypt(t)
     } catch {
-      return reply.redirect(FALLBACK_ORIGIN)
+      return reply.code(400).send('invalid token')
     }
 
-    if (Date.now() > data.exp) return reply.redirect(FALLBACK_ORIGIN)
+    if (Date.now() > data.exp) return reply.code(400).send('expired token')
 
     if (data.s) {
       reply.setCookie('__session', data.s, {
@@ -87,7 +89,7 @@ async function buildApp() {
       })
     }
 
-    return reply.redirect(data.p || '/')
+    return reply.redirect(safePath(data.p) || '/')
   })
 
   await fastify.ready()
@@ -110,7 +112,12 @@ describe('cookie-bridge-sidecar', () => {
   })
 
   describe('GET /export/*', () => {
-    it('redirects to __o target when no cookies present', async () => {
+    it('rejects requests without __o cookie', async () => {
+      const res = await app.inject({ method: 'GET', url: '/export/inbox' })
+      assert.equal(res.statusCode, 400)
+    })
+
+    it('redirects to __o target (wildcard path) when no session cookies present', async () => {
       const res = await app.inject({
         method: 'GET',
         url: '/export/inbox',
@@ -120,10 +127,39 @@ describe('cookie-bridge-sidecar', () => {
       assert.equal(res.headers.location, `https://${ORIGIN_DOMAIN}/inbox`)
     })
 
-    it('falls back to NEW_DOMAIN when __o cookie is absent', async () => {
-      const res = await app.inject({ method: 'GET', url: '/export/inbox' })
+    it('prefers ?to= over wildcard path', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/export/_migrate?to=%2Fbrowse%3Ffoo%3Dbar',
+        cookies: { __session: 'jwt', __o: ORIGIN_DOMAIN },
+      })
       assert.equal(res.statusCode, 302)
-      assert.equal(res.headers.location, `https://${NEW_DOMAIN}/inbox`)
+      const location = new URL(res.headers.location)
+      assert.equal(location.hostname, ORIGIN_DOMAIN)
+      assert.equal(location.pathname, '/_bridge')
+      const data = decrypt(location.searchParams.get('t'))
+      assert.equal(data.p, '/browse?foo=bar')
+    })
+
+    it('ignores ?to= values that are not safe local paths', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/export/inbox?to=//evil.example.com/steal',
+        cookies: { __o: ORIGIN_DOMAIN },
+      })
+      assert.equal(res.statusCode, 302)
+      // Falls back to the wildcard path when `to` is rejected.
+      assert.equal(res.headers.location, `https://${ORIGIN_DOMAIN}/inbox`)
+    })
+
+    it('ignores ?to= without leading slash', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/export/inbox?to=browse',
+        cookies: { __o: ORIGIN_DOMAIN },
+      })
+      assert.equal(res.statusCode, 302)
+      assert.equal(res.headers.location, `https://${ORIGIN_DOMAIN}/inbox`)
     })
 
     it('redirects to __o-derived origin with encrypted token', async () => {
@@ -237,7 +273,6 @@ describe('cookie-bridge-sidecar', () => {
         url: `/import?t=${token}`,
       })
       assert.equal(res.statusCode, 302)
-      // Success path now uses a same-origin relative redirect.
       assert.equal(res.headers.location, '/inbox')
 
       const cookies = res.cookies
@@ -278,42 +313,46 @@ describe('cookie-bridge-sidecar', () => {
       assert.ok(res.cookies.find(c => c.name === '__refresh'))
     })
 
-    it('rejects expired token', async () => {
+    it('rejects expired token with 400', async () => {
       const token = encrypt({ s: 'jwt', p: '/inbox', exp: Date.now() - 1000 })
       const res = await app.inject({
         method: 'GET',
         url: `/import?t=${token}`,
       })
-      assert.equal(res.statusCode, 302)
-      // Error path still uses absolute NEW_ORIGIN — there's no trusted path to
-      // redirect to relatively.
-      assert.equal(res.headers.location, `https://${NEW_DOMAIN}`)
+      assert.equal(res.statusCode, 400)
       assert.equal(res.cookies.length, 0)
     })
 
-    it('rejects tampered token', async () => {
+    it('rejects tampered token with 400', async () => {
       const token = encrypt({ s: 'jwt', p: '/', exp: Date.now() + 60_000 })
       const tampered = token.slice(0, -4) + 'XXXX'
       const res = await app.inject({
         method: 'GET',
         url: `/import?t=${tampered}`,
       })
-      assert.equal(res.statusCode, 302)
-      assert.equal(res.headers.location, `https://${NEW_DOMAIN}`)
+      assert.equal(res.statusCode, 400)
       assert.equal(res.cookies.length, 0)
     })
 
-    it('rejects completely invalid token', async () => {
+    it('rejects completely invalid token with 400', async () => {
       const res = await app.inject({
         method: 'GET',
         url: '/import?t=not-a-valid-token',
       })
-      assert.equal(res.statusCode, 302)
-      assert.equal(res.headers.location, `https://${NEW_DOMAIN}`)
+      assert.equal(res.statusCode, 400)
     })
 
-    it('redirects to relative root when path is missing', async () => {
+    it('redirects to root when path is missing', async () => {
       const token = encrypt({ s: 'jwt', exp: Date.now() + 60_000 })
+      const res = await app.inject({
+        method: 'GET',
+        url: `/import?t=${token}`,
+      })
+      assert.equal(res.headers.location, '/')
+    })
+
+    it('rejects unsafe path and redirects to root', async () => {
+      const token = encrypt({ s: 'jwt', p: '//evil.example.com/x', exp: Date.now() + 60_000 })
       const res = await app.inject({
         method: 'GET',
         url: `/import?t=${token}`,
