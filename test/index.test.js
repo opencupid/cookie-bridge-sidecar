@@ -1,9 +1,10 @@
-import { describe, it, before, after, beforeEach } from 'node:test'
+import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
 
 const SECRET = randomBytes(32).toString('hex')
 const NEW_DOMAIN = 'new.example.org'
+const ORIGIN_DOMAIN = 'origin.example.org'
 
 process.env.BRIDGE_SECRET = SECRET
 process.env.NEW_DOMAIN = NEW_DOMAIN
@@ -39,7 +40,8 @@ async function buildApp() {
   const fastify = Fastify()
   fastify.register(cookie)
 
-  const NEW_ORIGIN = `https://${process.env.NEW_DOMAIN}`
+  const FALLBACK_DOMAIN = process.env.NEW_DOMAIN
+  const FALLBACK_ORIGIN = `https://${FALLBACK_DOMAIN}`
   const TTL = 60
   const SECURE = process.env.NODE_ENV === 'production'
 
@@ -48,10 +50,17 @@ async function buildApp() {
     const s = req.cookies.__session
     const r = req.cookies.__refresh
 
-    if (!s && !r) return reply.redirect(`${NEW_ORIGIN}/${path}`)
+    const target = req.cookies.__o || FALLBACK_DOMAIN
+    const targetOrigin = `https://${target}`
+
+    const clearOpts = { path: '/', secure: SECURE, sameSite: 'strict' }
+    reply.clearCookie('__session', clearOpts)
+    reply.clearCookie('__refresh', clearOpts)
+
+    if (!s && !r) return reply.redirect(`${targetOrigin}/${path}`)
 
     const token = encrypt({ s, r, p: `/${path}`, exp: Date.now() + TTL * 1000 })
-    return reply.redirect(`${NEW_ORIGIN}/_bridge?t=${token}`)
+    return reply.redirect(`${targetOrigin}/_bridge?t=${token}`)
   })
 
   fastify.get('/import', async (req, reply) => {
@@ -60,10 +69,10 @@ async function buildApp() {
     try {
       data = decrypt(t)
     } catch {
-      return reply.redirect(NEW_ORIGIN)
+      return reply.redirect(FALLBACK_ORIGIN)
     }
 
-    if (Date.now() > data.exp) return reply.redirect(NEW_ORIGIN)
+    if (Date.now() > data.exp) return reply.redirect(FALLBACK_ORIGIN)
 
     if (data.s) {
       reply.setCookie('__session', data.s, {
@@ -78,11 +87,17 @@ async function buildApp() {
       })
     }
 
-    return reply.redirect(`${NEW_ORIGIN}${data.p || '/'}`)
+    return reply.redirect(data.p || '/')
   })
 
   await fastify.ready()
   return fastify
+}
+
+function findClearedCookie(cookies, name) {
+  return cookies.find(
+    c => c.name === name && (c.maxAge === 0 || (c.expires && c.expires.getTime() <= Date.now())),
+  )
 }
 
 describe('cookie-bridge-sidecar', () => {
@@ -95,21 +110,31 @@ describe('cookie-bridge-sidecar', () => {
   })
 
   describe('GET /export/*', () => {
-    it('redirects to new domain without token when no cookies present', async () => {
+    it('redirects to __o target when no cookies present', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/export/inbox',
+        cookies: { __o: ORIGIN_DOMAIN },
+      })
+      assert.equal(res.statusCode, 302)
+      assert.equal(res.headers.location, `https://${ORIGIN_DOMAIN}/inbox`)
+    })
+
+    it('falls back to NEW_DOMAIN when __o cookie is absent', async () => {
       const res = await app.inject({ method: 'GET', url: '/export/inbox' })
       assert.equal(res.statusCode, 302)
       assert.equal(res.headers.location, `https://${NEW_DOMAIN}/inbox`)
     })
 
-    it('encrypts session cookie into redirect token', async () => {
+    it('redirects to __o-derived origin with encrypted token', async () => {
       const res = await app.inject({
         method: 'GET',
         url: '/export/inbox',
-        cookies: { __session: 'jwt-token-value' },
+        cookies: { __session: 'jwt-token-value', __o: ORIGIN_DOMAIN },
       })
       assert.equal(res.statusCode, 302)
       const location = new URL(res.headers.location)
-      assert.equal(location.hostname, NEW_DOMAIN)
+      assert.equal(location.hostname, ORIGIN_DOMAIN)
       assert.equal(location.pathname, '/_bridge')
 
       const token = location.searchParams.get('t')
@@ -121,14 +146,58 @@ describe('cookie-bridge-sidecar', () => {
       assert.ok(data.exp <= Date.now() + 60_000)
     })
 
+    it('clears __session and __refresh cookies on export', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/export/inbox',
+        cookies: {
+          __session: 'jwt-token-value',
+          __refresh: 'refresh-uuid',
+          __o: ORIGIN_DOMAIN,
+        },
+      })
+      assert.equal(res.statusCode, 302)
+
+      const clearedSession = findClearedCookie(res.cookies, '__session')
+      const clearedRefresh = findClearedCookie(res.cookies, '__refresh')
+      assert.ok(clearedSession, '__session should be cleared')
+      assert.ok(clearedRefresh, '__refresh should be cleared')
+      assert.equal(clearedSession.path, '/')
+      assert.equal(clearedRefresh.path, '/')
+    })
+
+    it('clears cookies even when no session is present', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/export/inbox',
+        cookies: { __o: ORIGIN_DOMAIN },
+      })
+      assert.ok(findClearedCookie(res.cookies, '__session'))
+      assert.ok(findClearedCookie(res.cookies, '__refresh'))
+    })
+
+    it('does not clear the __o cookie', async () => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/export/inbox',
+        cookies: { __session: 'jwt', __o: ORIGIN_DOMAIN },
+      })
+      assert.equal(findClearedCookie(res.cookies, '__o'), undefined)
+    })
+
     it('encrypts both cookies into redirect token', async () => {
       const res = await app.inject({
         method: 'GET',
         url: '/export/settings/profile',
-        cookies: { __session: 'jwt-value', __refresh: 'refresh-uuid' },
+        cookies: {
+          __session: 'jwt-value',
+          __refresh: 'refresh-uuid',
+          __o: ORIGIN_DOMAIN,
+        },
       })
       assert.equal(res.statusCode, 302)
       const location = new URL(res.headers.location)
+      assert.equal(location.hostname, ORIGIN_DOMAIN)
       const data = decrypt(location.searchParams.get('t'))
       assert.equal(data.s, 'jwt-value')
       assert.equal(data.r, 'refresh-uuid')
@@ -139,7 +208,7 @@ describe('cookie-bridge-sidecar', () => {
       const res = await app.inject({
         method: 'GET',
         url: '/export/dashboard',
-        cookies: { __refresh: 'refresh-only-uuid' },
+        cookies: { __refresh: 'refresh-only-uuid', __o: ORIGIN_DOMAIN },
       })
       assert.equal(res.statusCode, 302)
       const location = new URL(res.headers.location)
@@ -152,7 +221,7 @@ describe('cookie-bridge-sidecar', () => {
       const res = await app.inject({
         method: 'GET',
         url: '/export/',
-        cookies: { __session: 'jwt' },
+        cookies: { __session: 'jwt', __o: ORIGIN_DOMAIN },
       })
       const location = new URL(res.headers.location)
       const data = decrypt(location.searchParams.get('t'))
@@ -168,7 +237,8 @@ describe('cookie-bridge-sidecar', () => {
         url: `/import?t=${token}`,
       })
       assert.equal(res.statusCode, 302)
-      assert.equal(res.headers.location, `https://${NEW_DOMAIN}/inbox`)
+      // Success path now uses a same-origin relative redirect.
+      assert.equal(res.headers.location, '/inbox')
 
       const cookies = res.cookies
       const sessionCookie = cookies.find(c => c.name === '__session')
@@ -203,7 +273,7 @@ describe('cookie-bridge-sidecar', () => {
         url: `/import?t=${token}`,
       })
       assert.equal(res.statusCode, 302)
-      assert.equal(res.headers.location, `https://${NEW_DOMAIN}/dashboard`)
+      assert.equal(res.headers.location, '/dashboard')
       assert.ok(res.cookies.find(c => c.name === '__session'))
       assert.ok(res.cookies.find(c => c.name === '__refresh'))
     })
@@ -215,6 +285,8 @@ describe('cookie-bridge-sidecar', () => {
         url: `/import?t=${token}`,
       })
       assert.equal(res.statusCode, 302)
+      // Error path still uses absolute NEW_ORIGIN — there's no trusted path to
+      // redirect to relatively.
       assert.equal(res.headers.location, `https://${NEW_DOMAIN}`)
       assert.equal(res.cookies.length, 0)
     })
@@ -240,13 +312,13 @@ describe('cookie-bridge-sidecar', () => {
       assert.equal(res.headers.location, `https://${NEW_DOMAIN}`)
     })
 
-    it('redirects to root when path is missing', async () => {
+    it('redirects to relative root when path is missing', async () => {
       const token = encrypt({ s: 'jwt', exp: Date.now() + 60_000 })
       const res = await app.inject({
         method: 'GET',
         url: `/import?t=${token}`,
       })
-      assert.equal(res.headers.location, `https://${NEW_DOMAIN}/`)
+      assert.equal(res.headers.location, '/')
     })
   })
 })
