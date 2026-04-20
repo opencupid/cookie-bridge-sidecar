@@ -5,7 +5,8 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
 const app = Fastify()
 app.register(cookie)
 
-const NEW_ORIGIN = `https://${process.env.NEW_DOMAIN}`
+const FALLBACK_DOMAIN = process.env.NEW_DOMAIN
+const FALLBACK_ORIGIN = `https://${FALLBACK_DOMAIN}`
 const KEY = Buffer.from(process.env.BRIDGE_SECRET, 'hex')
 const TTL = 60
 const SECURE = process.env.NODE_ENV === 'production'
@@ -34,10 +35,22 @@ app.get('/export/*', async (req, reply) => {
   const s = req.cookies.__session
   const r = req.cookies.__refresh
 
-  if (!s && !r) return reply.redirect(`${NEW_ORIGIN}/${path}`)
+  // Origin brand comes from the __o cookie (set by the backend when the user's
+  // home brand differs from the serving host). Fall back to NEW_DOMAIN for
+  // deployments that haven't started setting __o yet.
+  const target = req.cookies.__o || FALLBACK_DOMAIN
+  const targetOrigin = `https://${target}`
+
+  // Always clear source-host session cookies — the user is leaving this brand.
+  // __o is persistent by design and must NOT be cleared.
+  const clearOpts = { path: '/', secure: SECURE, sameSite: 'strict' }
+  reply.clearCookie('__session', clearOpts)
+  reply.clearCookie('__refresh', clearOpts)
+
+  if (!s && !r) return reply.redirect(`${targetOrigin}/${path}`)
 
   const token = encrypt({ s, r, p: `/${path}`, exp: Date.now() + TTL * 1000 })
-  return reply.redirect(`${NEW_ORIGIN}/_bridge?t=${token}`)
+  return reply.redirect(`${targetOrigin}/_bridge?t=${token}`)
 })
 
 app.get('/import', async (req, reply) => {
@@ -46,10 +59,10 @@ app.get('/import', async (req, reply) => {
   try {
     data = decrypt(t)
   } catch {
-    return reply.redirect(NEW_ORIGIN)
+    return reply.redirect(FALLBACK_ORIGIN)
   }
 
-  if (Date.now() > data.exp) return reply.redirect(NEW_ORIGIN)
+  if (Date.now() > data.exp) return reply.redirect(FALLBACK_ORIGIN)
 
   if (data.s) {
     reply.setCookie('__session', data.s, {
@@ -64,7 +77,9 @@ app.get('/import', async (req, reply) => {
     })
   }
 
-  return reply.redirect(`${NEW_ORIGIN}${data.p || '/'}`)
+  // Response is served on the target host, so a relative redirect keeps us
+  // on the same origin without coupling the import path to NEW_DOMAIN.
+  return reply.redirect(data.p || '/')
 })
 
 app.listen({ port: 3099, host: '0.0.0.0' })
